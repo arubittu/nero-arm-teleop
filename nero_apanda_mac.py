@@ -19,7 +19,8 @@ Leader-follower teleoperation, AgileX Nero x2, with a SPACEBAR gravity-comp clut
   USB-CAN 003800294148570A20343133:0 = FOLLOWER
   firmware 1.21 -> profile v121
 
-  Flags: --check  --no-home  --no-camera  --no-record  --no-gripper  --dry-home  --help
+  Flags: --check  --no-home  --no-camera  --no-record  --no-gripper
+         --dry-home  --preview-cameras  --help
 
 START POSE
 
@@ -68,9 +69,12 @@ WHY IT IS BUILT THIS WAY
 """
 
 import datetime
+import mmap
 import os
 import select
+import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -89,9 +93,10 @@ nero_apanda_mac.py — leader-follower teleop with a spacebar clutch
   --check        read arm poses and exit without motor commands
   --no-home      skip HOME; requires both arms within 0.10 rad
   --no-camera    do not open the OAK-D (joints are still recorded)
-  --no-record    do not write any HDF5 files (camera is skipped too)
+  --no-record    do not write HDF5 files (camera runs for preview if requested)
   --no-gripper   skip Leader gripper commands and follower gripper mirroring
   --dry-home     move to the start pose, then exit without entering teleop
+  --preview-cameras  show live RealSense global RGB + OAK wrist RGB
   -h, --help     print this and exit
 
   Keys once running:
@@ -107,7 +112,7 @@ nero_apanda_mac.py — leader-follower teleop with a spacebar clutch
     python nero_apanda_mac.py --dry-home
 """
 
-_KNOWN = {"--check", "--no-home", "--no-camera", "--no-record", "--no-gripper", "--dry-home", "-h", "--help"}
+_KNOWN = {"--check", "--no-home", "--no-camera", "--no-record", "--no-gripper", "--dry-home", "--preview-cameras", "-h", "--help"}
 _argv = sys.argv[1:]
 _bad = [a for a in _argv if a not in _KNOWN]
 if _bad:
@@ -118,6 +123,9 @@ if "-h" in _argv or "--help" in _argv:
     sys.exit(0)
 DRY_HOME = "--dry-home" in _argv
 CHECK_ONLY = "--check" in _argv
+PREVIEW_CAMERAS = "--preview-cameras" in _argv
+if PREVIEW_CAMERAS and (CHECK_ONLY or DRY_HOME or "--no-camera" in _argv):
+    raise SystemExit("--preview-cameras needs a teleop run with the OAK camera enabled")
 
 import numpy as np
 
@@ -218,6 +226,7 @@ CAMERA            = True
 CAMERA_DEPTH      = True
 CAMERA_FPS        = 30
 RGB_SIZE          = (640, 400)
+PREVIEW_FRAME_BYTES = RGB_SIZE[0] * RGB_SIZE[1] * 3
 DEPTH_SIZE        = (640, 400)   # depth arrives 1280x800; downscaled on host
 JPEG_QUALITY      = 90           # ~50KB/frame at 640x400; raise for fidelity
 
@@ -229,7 +238,7 @@ if "--no-home" in _argv:
     HOME_ON_START = False
 if "--no-record" in _argv:
     RECORD = False
-    CAMERA = False          # nowhere to put the frames
+    CAMERA = PREVIEW_CAMERAS
 if "--no-camera" in _argv:
     CAMERA = False
 if "--no-gripper" in _argv:
@@ -237,6 +246,16 @@ if "--no-gripper" in _argv:
 if DRY_HOME:
     CAMERA = False          # nothing to record in a homing-only run
     RECORD = False
+
+
+if PREVIEW_CAMERAS:
+    if cv2 is None or dai is None:
+        raise SystemExit("--preview-cameras needs DepthAI and OpenCV with window support")
+    PREVIEW_SCRIPT = os.path.join(os.path.dirname(__file__), "nero_camera_preview.py")
+    check = subprocess.run([sys.executable, PREVIEW_SCRIPT, "--check"],
+                           capture_output=True, text=True, timeout=8)
+    if check.returncode != 0:
+        raise SystemExit(check.stderr.strip() or "Camera preview check failed")
 
 
 # ---------------------------------------------------------------- helpers ---
@@ -658,6 +677,7 @@ class CameraSource:
         self.running = False
         self.frames = 0
         self.last_shape = None
+        self.preview_map = None
         if CAMERA and (dai is None or cv2 is None):
             print("[warn] depthai/opencv not installed — camera disabled. "
                   "pip install depthai opencv-python")
@@ -721,8 +741,15 @@ class CameraSource:
                     if frame is not None:
                         self.frames += 1
                         self.last_shape = (frame.getWidth(), frame.getHeight())
+                        rgb = frame.getCvFrame()
+                        if self.preview_map is not None and rgb.shape == (400, 640, 3):
+                            slot = 1 - self.preview_map[0]
+                            offset = 1 + slot * PREVIEW_FRAME_BYTES
+                            np.ndarray(rgb.shape, dtype=np.uint8,
+                                       buffer=self.preview_map, offset=offset)[:] = rgb
+                            self.preview_map[0] = slot
                         if self.recorder.active:
-                            ok, buf = cv2.imencode(".jpg", frame.getCvFrame(), enc)
+                            ok, buf = cv2.imencode(".jpg", rgb, enc)
                             if ok:
                                 self.recorder.camera_sample(
                                     frame.getTimestamp().total_seconds(),
@@ -909,6 +936,9 @@ if not DRY_HOME:
     elif CAMERA:
         print()
         print("  Camera: DISABLED")
+    if PREVIEW_CAMERAS:
+        print("  Live preview: RealSense global RGB + OAK wrist RGB")
+        print("  Control keys work in the preview window or terminal.")
     print("=" * 68)
 print()
 
@@ -1007,13 +1037,34 @@ if START_WITH_GC and not DRY_HOME:
 
 # --------------------------------------------------------------- main loop ---
 next_tick = time.perf_counter()
+preview_path = None
+preview_map = None
+preview_process = None
 try:
+    if PREVIEW_CAMERAS:
+        with tempfile.NamedTemporaryFile(prefix="nero_cameras_", delete=False) as frame_file:
+            preview_path = frame_file.name
+            frame_file.truncate(1 + 2 * PREVIEW_FRAME_BYTES)
+            preview_map = mmap.mmap(frame_file.fileno(), 0)
+        camera.preview_map = preview_map
+        preview_process = subprocess.Popen(
+            [sys.executable, PREVIEW_SCRIPT, preview_path],
+            stdout=subprocess.PIPE,
+        )
     with Keyboard() as kb:
         while not DRY_HOME:
+            if preview_process is not None and preview_process.poll() is not None:
+                print("[warn] Camera preview stopped; ending teleoperation.")
+                break
             now = time.perf_counter()
 
             # ---- keys --------------------------------------------------------
             key = kb.get()
+            if (key is None and preview_process is not None and preview_process.stdout
+                    and select.select([preview_process.stdout], [], [], 0)[0]):
+                window_key = os.read(preview_process.stdout.fileno(), 1)
+                if window_key:
+                    key = window_key.decode("ascii", errors="ignore")
             k = key.lower() if key is not None and key != " " else key
 
             if k in ("q",):
@@ -1112,6 +1163,20 @@ finally:
     # Flush an episode that was still running when you quit, then stop the camera.
     _try("recorder.stop", recorder.stop, True)
     _try("camera.stop", camera.stop)
+    if preview_process is not None:
+        if preview_process.poll() is None:
+            preview_process.terminate()
+        try:
+            preview_process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            preview_process.kill()
+            preview_process.wait()
+        if preview_process.stdout is not None:
+            preview_process.stdout.close()
+    if preview_map is not None:
+        _try("preview buffer close", preview_map.close)
+    if preview_path is not None:
+        _try("preview buffer remove", os.unlink, preview_path)
 
     # Return to position hold without cutting motor support from raised arms.
     old_locked = leader.get_joint_angles()

@@ -1,6 +1,6 @@
 # AgileX NERO on macOS
 
-Two Python scripts for this two-arm setup. They use the USB-CAN adapter IDs and saved HOME pose in the files. Check those values before using another setup.
+Two user-facing Python scripts for this two-arm setup. They use the USB-CAN adapter IDs and saved HOME pose in the files. Check those values before using another setup.
 
 ## Setup
 
@@ -32,9 +32,11 @@ This is a macOS adaptation of [`apanda-champ/AgileX_Nero_setup`](https://github.
 ```sh
 python nero_apanda_mac.py --check --no-home
 python nero_apanda_mac.py --no-home
+python nero_apanda_mac.py --no-home --preview-cameras
 python nero_apanda_mac.py --help
 ```
 
 Use `--no-home` after both arms have reached the saved HOME pose. The Panda script's `--dry-home` uses a straight joint ramp and is not a general route from a released table-rest pose. While running, press `r` to start a demo, `e` to save it, `h` to return HOME, and `q` to quit.
 
-The Panda script records the OAK camera. The separate RealSense D435 global camera is not part of this code.
+The Panda script records the OAK camera. `--preview-cameras` opens a live side-by-side RGB window during teleop. It needs `ffmpeg` (`brew install ffmpeg`) to select the RealSense D435 RGB device on macOS. The global view is for display only and is not saved with demos.
+The preview uses `nero_camera_preview.py` in a separate process so its window does not slow the arm-control loop. If macOS lists only the RealSense depth feed, reconnect the RealSense USB cable and rerun the command.
