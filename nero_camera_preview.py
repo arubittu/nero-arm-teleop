@@ -49,12 +49,14 @@ def panel(frame, label):
 
 def show(path):
     index = real_sense_rgb_index()
-    cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
-    if not cap.isOpened():
-        raise SystemExit("Could not open RealSense RGB camera")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    # OpenCV's AVFoundation capture can return black frames from this D435
+    # even while ffmpeg reads the RGB stream correctly.
+    camera = subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
+         "-framerate", "30", "-video_size", "640x480", "-i", f"{index}:none",
+         "-an", "-vf", "fps=15", "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"],
+        stdout=subprocess.PIPE,
+    )
     try:
         with open(path, "r+b") as frame_file:
             with mmap.mmap(frame_file.fileno(), 0, access=mmap.ACCESS_READ) as shared:
@@ -62,9 +64,10 @@ def show(path):
                 cv2.resizeWindow(WINDOW, 1280, 400)
                 while True:
                     started = time.perf_counter()
-                    ok, global_frame = cap.read()
-                    if not ok:
+                    raw = camera.stdout.read(640 * 480 * 3)
+                    if len(raw) != 640 * 480 * 3:
                         raise SystemExit("RealSense RGB stopped returning frames")
+                    global_frame = np.frombuffer(raw, dtype=np.uint8).reshape(480, 640, 3)
                     slot = shared[0]
                     offset = 1 + slot * FRAME_BYTES
                     wrist = np.ndarray(WRIST_SHAPE, dtype=np.uint8,
@@ -79,7 +82,9 @@ def show(path):
                         break
                     time.sleep(max(0, 1 / 15 - (time.perf_counter() - started)))
     finally:
-        cap.release()
+        camera.terminate()
+        camera.wait()
+        camera.stdout.close()
         cv2.destroyAllWindows()
 
 
