@@ -1,0 +1,17 @@
+name: nero-arm
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - conda-forge::libusb
+  - pip:
+      - git+https://github.com/agilexrobotics/pyAgxArm.git@d90e234ba8e408cfa964b38aa9120b3131fc9f85
+      - python-can[gs-usb]==4.6.1
+      - python-can-candle==1.2.4
+      - pyserial==3.5
+      - numpy==2.4.6
+      - h5py==3.16.0
+      - opencv-python-headless==5.0.0.93
+      - depthai==3.11.0

@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+episodes/
+.DS_Store
