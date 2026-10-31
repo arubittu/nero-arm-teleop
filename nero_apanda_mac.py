@@ -280,8 +280,28 @@ def unwrap(obj):
 def read_start_angles(arm):
     status = arm.get_arm_status()
     if status is not None and status.msg.ctrl_mode == arm.ARM_STATUS.CtrlMode.CAN_CTRL:
-        return unwrap(arm.get_joint_angles())
-    return unwrap(arm.get_leader_joint_angles())
+        return arm.get_joint_angles()
+    leader_angles = arm.get_leader_joint_angles()
+    return leader_angles if leader_angles is not None else arm.get_joint_angles()
+
+
+def wait_for_start_angles(arms, timeout_s=6):
+    """Require two fresh joint samples from each arm before enabling motors."""
+    last_stamps = [None] * len(arms)
+    ready = [None] * len(arms)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for i, arm in enumerate(arms):
+            sample = read_start_angles(arm)
+            if sample is None:
+                continue
+            if last_stamps[i] is not None and sample.timestamp != last_stamps[i]:
+                ready[i] = list(sample.msg)
+            last_stamps[i] = sample.timestamp
+        if all(pose is not None for pose in ready):
+            return ready
+        time.sleep(0.1)
+    return ready
 
 
 def read_leader_width(gc_active):
@@ -804,12 +824,11 @@ leader.connect()
 follower.connect()
 time.sleep(CONNECT_SETTLE_S)
 
-leader_start = read_start_angles(leader)
-follower_start = read_start_angles(follower)
+leader_start, follower_start = wait_for_start_angles((leader, follower))
 if leader_start is None or follower_start is None:
     _try("leader disconnect", leader.disconnect)
     _try("follower disconnect", follower.disconnect)
-    raise SystemExit("Could not read both current poses. No motor enable command sent.")
+    raise SystemExit("Could not read fresh poses from both arms. No motor enable command sent.")
 print(f"[check] Leader:   {[round(v, 3) for v in leader_start]}")
 print(f"[check] Follower: {[round(v, 3) for v in follower_start]}")
 if HOME_ON_START:
