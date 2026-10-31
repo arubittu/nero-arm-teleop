@@ -3,6 +3,7 @@
 import mmap
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -94,6 +95,7 @@ if __name__ == "__main__":
             raise SystemExit("Camera preview needs OpenCV with window support")
         real_sense_rgb_index()
     elif len(sys.argv) == 2:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         show(sys.argv[1])
     else:
         raise SystemExit("Use --check or pass the preview buffer path")
