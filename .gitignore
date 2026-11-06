@@ -1,4 +1,16 @@
 __pycache__/
 *.pyc
 episodes/
+episodes_dagger/
+episodes_*/
+lerobot_nero_pi05/
+dataset/
+outputs/
+cache/
+env/
+blackwell_training/plots/
+*.h5
+*.safetensors
+*.log
 .DS_Store
+nero_pi05_lerobot_v3_9episodes.zip

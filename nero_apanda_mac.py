@@ -15,8 +15,7 @@ Leader-follower teleoperation, AgileX Nero x2, with a SPACEBAR gravity-comp clut
 
   Normal cycle:  h -> r -> demonstrate -> e -> h -> r -> ...
 
-  USB-CAN 004900334148570D20343133:0 = LEADER
-  USB-CAN 003800294148570A20343133:0 = FOLLOWER
+  USB-CAN IDs and HOME pose are in nero_user_config.py.
   firmware 1.21 -> profile v121
 
   Flags: --check  --no-home  --no-camera  --no-record  --no-gripper
@@ -58,7 +57,7 @@ WHY IT IS BUILT THIS WAY
   Both report the same 0.000-0.10091 m range, so the reader switches with the
   clutch and the follower mirrors at GRIP_GAIN in both states.
 
-  Recording. One HDF5 file per demo, and recording is INDEPENDENT of the
+  Recording. Three HDF5 files per demo, and recording is INDEPENDENT of the
   clutch: r opens an episode, e writes it, d throws it away. Gravity comp is a
   property of the arm, not a file boundary -- tying them together would make it
   impossible to home between demos without cutting a file. Samples are buffered
@@ -97,6 +96,7 @@ nero_apanda_mac.py — leader-follower teleop with a spacebar clutch
   --no-gripper   skip Leader gripper commands and follower gripper mirroring
   --dry-home     move to the start pose, then exit without entering teleop
   --preview-cameras  show live RealSense global RGB + OAK wrist RGB
+  --record-dir PATH  save episodes in PATH (default: episodes/)
   -h, --help     print this and exit
 
   Keys once running:
@@ -114,6 +114,14 @@ nero_apanda_mac.py — leader-follower teleop with a spacebar clutch
 
 _KNOWN = {"--check", "--no-home", "--no-camera", "--no-record", "--no-gripper", "--dry-home", "--preview-cameras", "-h", "--help"}
 _argv = sys.argv[1:]
+_record_dir_arg = None
+if "--record-dir" in _argv:
+    _index = _argv.index("--record-dir")
+    if _index + 1 >= len(_argv) or _argv[_index + 1].startswith("--"):
+        print(f"--record-dir needs a folder path\n{USAGE}")
+        sys.exit(2)
+    _record_dir_arg = _argv[_index + 1]
+    del _argv[_index:_index + 2]
 _bad = [a for a in _argv if a not in _KNOWN]
 if _bad:
     print(f"Unknown flag(s): {' '.join(_bad)}\n{USAGE}")
@@ -142,22 +150,24 @@ except ImportError:
     dai = None
 
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel, NeroFW
+from nero_user_config import (
+    CAMERA_DEPTH, CAMERA_FPS, CLAMP_TO_FOLLOWER_RANGE, DATASET_FPS,
+    FOLLOWER_CHANNEL, FOLLOWER_GRIP_FORCE, FOLLOWER_MAX_M, FOLLOWER_MIN_M,
+    GC_WARN_S, GLOBAL_CAPTURE_SIZE, GRIP_GAIN, GRIP_REASSERT_S, H5_COMPRESSION,
+    HOME_DURATION_S, HOME_FOLLOWER_TOO, HOME_HOLD_S, HOME_MAX_DELTA_RAD,
+    HOME_ON_START, HOME_POSE, HOME_WARN_MID_S, HOME_WARN_S, JPEG_QUALITY,
+    LEADER_CHANNEL, LEADER_GRIP_FORCE, LEADER_GRIP_TARGET, LOOP_HZ,
+    MIRROR_GRIPPER, RECORD, RECORD_DIR, RECORD_FOLLOWER,
+    SAVED_IMAGE_SIZE, START_WITH_GC, TASK_TEXT, WRIST_CAPTURE_SIZE,
+)
+if _record_dir_arg is not None:
+    RECORD_DIR = os.path.abspath(os.path.expanduser(_record_dir_arg))
 
 # ----------------------------------------------------------------- tuning ---
-LEADER_CHANNEL    = "004900334148570D20343133:0"
-FOLLOWER_CHANNEL  = "003800294148570A20343133:0"
-
-LOOP_HZ           = 50.0
 LOOP_DT           = 1.0 / LOOP_HZ
 CONNECT_SETTLE_S  = 2.0
 MODE_SETTLE_S     = 0.08          # let feedback swap over after a mode change
 MIN_TOGGLE_GAP_S  = 0.30          # ignore repeats from a held spacebar
-
-# Leader gripper: enabled but below stall, so the jaws stay hand-free and
-# keep reporting while the arm is locked.
-LEADER_GRIP_FORCE   = 0.05
-LEADER_GRIP_TARGET  = 0.1
-GRIP_REASSERT_S     = 1.0
 
 # ---- start pose -------------------------------------------------------------
 # Both arms are driven here once at startup, before the clutch loop begins.
@@ -167,14 +177,6 @@ GRIP_REASSERT_S     = 1.0
 # The follower is homed as well, not as a nicety: the loop mirrors leader ->
 # follower every tick, so if only the leader moved, the first tick would command
 # the follower across the whole gap in a single unsmoothed move_js.
-HOME_ON_START     = True
-HOME_POSE         = [-0.056, -0.329, 0.164, 1.730, -0.001, 0.091, 0.281]
-HOME_FOLLOWER_TOO = True
-HOME_DURATION_S   = 4.0       # ramp time; longer is gentler
-HOME_HOLD_S       = 0.5       # keep commanding the target after arrival
-HOME_MAX_DELTA_RAD = 1.8      # refuse to auto-home if any joint is further out
-HOME_WARN_S       = 3.0       # countdown before anything moves
-HOME_WARN_MID_S   = 0.0       # countdown for a mid-session h (you are right there)
 POSE_PRINT_KEY    = "p"
 
 # ---- keys -------------------------------------------------------------------
@@ -186,49 +188,21 @@ HOME_KEY          = "h"       # go to HOME_POSE (drops GC and restores it)
 REC_START_KEY     = "r"       # begin a demo
 REC_END_KEY       = "e"       # end the demo and write it
 GC_TOGGLE_KEY     = " "       # manual clutch, kept as an escape hatch
-START_WITH_GC     = True      # engage gravity comp once homing is done
-GC_WARN_S         = 3.0       # countdown before the leader goes weightless
-
-# Gripper mapping: the follower's jaws move GRIP_GAIN units for every unit the
-# leader's move. Gain 1.0 is pass-through; above 1 is coarser (small hand
-# movements produce large jaw changes); below 1 is finer, for delicate grasps.
-# Zero always maps to zero, so fully-closed leader jaws still fully close the
-# follower whatever the gain. The clamp exists only so an out-of-range value is
-# never sent on.
-GRIP_GAIN         = 1.5
-CLAMP_TO_FOLLOWER_RANGE = True
-FOLLOWER_MIN_M    = 0.000
-FOLLOWER_MAX_M    = 0.1
-FOLLOWER_GRIP_FORCE = 2.0
-MIRROR_GRIPPER    = True
-
 ERR_LOG_PERIOD_S  = 2.0
 
 # ---- recording --------------------------------------------------------------
-# One HDF5 file per episode. An episode is one span of gravity comp: it starts
-# when you press SPACE to engage GC and ends when you press SPACE to release it
-# (or on exit). Samples are buffered in RAM and written once at episode end --
-# writing at 50Hz would put file I/O jitter into the control loop.
-RECORD            = True
-RECORD_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "episodes")
-RECORD_FOLLOWER   = True      # also log the follower's actual state
-H5_COMPRESSION    = "gzip"    # None to disable
+# The r/e keys bound each episode. Samples are buffered in RAM and written once
+# at episode end so file I/O cannot add jitter to the control loop.
 DISCARD_KEY       = "d"       # drop the episode in progress instead of saving
 
 # ---- camera -----------------------------------------------------------------
-# OAK-D runs at 30 FPS against this 50Hz loop, so frames are stored with their
-# OWN device timestamps rather than one per control tick. The camera lives on a
-# separate thread: JPEG encoding in the control loop would add timing jitter.
-#
-# Device timestamps are synced to the host steady clock, so joint samples are
-# taken with time.monotonic() (NOT perf_counter) to share one clock with them.
+# OAK-D runs at 30 FPS against this 50Hz loop. Camera threads timestamp frames
+# on arrival with time.monotonic(), the same clock used for joints. Device and
+# Python monotonic clocks have different origins on this Mac.
 CAMERA            = True
-CAMERA_DEPTH      = True
-CAMERA_FPS        = 30
-RGB_SIZE          = (640, 400)
+RGB_SIZE          = WRIST_CAPTURE_SIZE
 PREVIEW_FRAME_BYTES = RGB_SIZE[0] * RGB_SIZE[1] * 3
-DEPTH_SIZE        = (640, 400)   # depth arrives 1280x800; downscaled on host
-JPEG_QUALITY      = 90           # ~50KB/frame at 640x400; raise for fidelity
+DEPTH_SIZE        = WRIST_CAPTURE_SIZE  # used only if depth is enabled
 
 
 # ------------------------------------------------------------- command line ---
@@ -480,12 +454,10 @@ class Keyboard:
 
 
 class Recorder:
-    """One HDF5 file per episode. Buffers in RAM, writes on episode end.
+    """Three HDF5 files per episode. Buffers in RAM, writes on episode end.
 
-    A sample is only stored when the leader's joints AND width are both
-    available this tick. A dropped read is skipped, never carried forward --
-    repeating the last value would fabricate data, and timestamps are stored
-    explicitly so the gap is visible rather than hidden.
+    Store a sample only when follower state and sent targets are available.
+    Missing reads are skipped rather than repeated as fabricated data.
     """
 
     def __init__(self, directory, record_follower, compression):
@@ -513,12 +485,14 @@ class Recorder:
             except (IndexError, ValueError):
                 pass
         print(f"[init] Recording to {os.path.abspath(self.dir)}/ "
-              f"(next episode {self.episode + 1:04d}, joints and camera "
-              f"written as separate files)")
+              f"(next episode {self.episode + 1:04d}, joints and both RGB "
+              f"cameras written as separate files)")
 
     def _clear(self):
         self.t, self.lj, self.lw, self.fj, self.fw = [], [], [], [], []
+        self.aj, self.aw = [], []  # targets actually sent to the follower
         self.cam_t, self.cam_jpg, self.cam_depth = [], [], []
+        self.global_t, self.global_jpg = [], []
         self.t0 = None
         self.started_iso = None
         self.dropped = 0
@@ -529,17 +503,19 @@ class Recorder:
         with self.lock:
             self.episode += 1
             self._clear()
-            # monotonic, NOT perf_counter: DepthAI device timestamps are synced
-            # to the host steady clock, so this puts both streams on one clock.
+            # The joint and camera threads use the same host monotonic clock.
             self.t0 = time.monotonic()
             self.started_iso = datetime.datetime.now().isoformat(timespec="seconds")
             self.active = True
         print(f"[REC] Episode {self.episode:04d} started")
 
-    def sample(self, leader_joints, leader_width, follower_joints, follower_width):
+    def sample(self, leader_joints, leader_width, follower_joints, follower_width,
+               target_joints, target_width):
         if not (self.enabled and self.active):
             return
-        if leader_joints is None or leader_width is None:
+        if (leader_joints is None or leader_width is None
+                or follower_joints is None or follower_width is None
+                or target_joints is None or target_width is None):
             self.dropped += 1
             return
         with self.lock:
@@ -548,23 +524,33 @@ class Recorder:
             self.t.append(time.monotonic() - self.t0)
             self.lj.append(list(leader_joints))
             self.lw.append(float(leader_width))
+            self.aj.append(list(target_joints))
+            self.aw.append(float(target_width))
             if self.record_follower:
                 self.fj.append(list(follower_joints) if follower_joints is not None
                                else [float("nan")] * len(leader_joints))
                 self.fw.append(float(follower_width) if follower_width is not None
                                else float("nan"))
 
-    def camera_sample(self, device_ts, jpeg, depth):
-        """Called from the camera thread. device_ts is on the monotonic clock."""
+    def camera_sample(self, host_ts, jpeg, depth):
+        """Called from the camera thread with a host monotonic timestamp."""
         if not (self.enabled and self.active):
             return
         with self.lock:
             if not self.active or self.t0 is None:
                 return
-            self.cam_t.append(device_ts - self.t0)
+            self.cam_t.append(host_ts - self.t0)
             self.cam_jpg.append(jpeg)
             if CAMERA_DEPTH:
                 self.cam_depth.append(depth)
+
+    def global_sample(self, host_ts, jpeg):
+        if not (self.enabled and self.active):
+            return
+        with self.lock:
+            if self.active and self.t0 is not None:
+                self.global_t.append(host_ts - self.t0)
+                self.global_jpg.append(jpeg)
 
     def stop(self, save=True):
         if not (self.enabled and self.active):
@@ -589,6 +575,7 @@ class Recorder:
         base = f"ep_{self.episode:04d}_{stamp}"
         jpath = os.path.join(self.dir, base + "_joints.h5")
         cpath = os.path.join(self.dir, base + "_camera.h5")
+        gpath = os.path.join(self.dir, base + "_global_camera.h5")
         duration = self.t[-1]
 
         written = []
@@ -598,38 +585,47 @@ class Recorder:
         ok_c = self._write_camera(cpath, duration) if self.cam_t else False
         if ok_c:
             written.append(cpath)
+        ok_g = self._write_global_camera(gpath, duration) if self.global_t else False
+        if ok_g:
+            written.append(gpath)
 
         rate = len(self.t) / duration if duration > 0 else 0.0
         cam_rate = len(self.cam_t) / duration if duration > 0 and self.cam_t else 0.0
         mb = sum(os.path.getsize(p) for p in written) / 1e6
         print(f"[REC] Episode {self.episode:04d} saved: {len(self.t)} samples "
-              f"@ {rate:.1f}Hz, {len(self.cam_t)} frames @ {cam_rate:.1f}Hz, "
+              f"@ {rate:.1f}Hz, {len(self.cam_t)} wrist frames @ {cam_rate:.1f}Hz, "
+              f"{len(self.global_t)} global frames, "
               f"{duration:.1f}s, {self.dropped} dropped, {mb:.1f} MB")
         for p in written:
             print(f"      {p}")
         if self.cam_t and not ok_c:
             print("      [warn] camera file was NOT written")
+        if not ok_g:
+            print("      [warn] global RGB file was NOT written; episode cannot be exported")
         self._clear()
         return written or None
 
     def _common_attrs(self, f, duration):
-        """Written into BOTH files so a pair can be matched and cross-checked."""
+        """Written into all files so their streams can be matched."""
         f.attrs["episode"] = self.episode
         f.attrs["start_wall_time"] = self.started_iso
         f.attrs["t0_monotonic"] = self.t0
         f.attrs["duration_s"] = duration
+        f.attrs["task"] = TASK_TEXT
         f.attrs["clock"] = ("time.monotonic; timestamps are seconds since "
-                            "t0_monotonic; camera stamps are device-synced to "
-                            "the same clock")
+                            "t0_monotonic; camera stamps use host arrival time")
 
     def _write_joints(self, path, duration):
         kw = {"compression": self.compression} if self.compression else {}
         try:
-            with h5py.File(path, "w") as f:
+            with h5py.File(path, "x") as f:
                 f.create_dataset("timestamps", data=np.asarray(self.t), **kw)
                 g = f.create_group("leader")
                 g.create_dataset("joint_angles", data=np.asarray(self.lj), **kw)
                 g.create_dataset("gripper", data=np.asarray(self.lw), **kw)
+                target = f.create_group("action_target")
+                target.create_dataset("joint_angles", data=np.asarray(self.aj), **kw)
+                target.create_dataset("gripper", data=np.asarray(self.aw), **kw)
                 if self.record_follower:
                     g2 = f.create_group("follower")
                     g2.create_dataset("joint_angles", data=np.asarray(self.fj), **kw)
@@ -653,7 +649,7 @@ class Recorder:
     def _write_camera(self, path, duration):
         kw = {"compression": self.compression} if self.compression else {}
         try:
-            with h5py.File(path, "w") as f:
+            with h5py.File(path, "x") as f:
                 f.create_dataset("timestamps", data=np.asarray(self.cam_t), **kw)
                 # JPEG frames are variable length, so a vlen uint8 dataset.
                 # Decode with cv2.imdecode(arr, cv2.IMREAD_COLOR).
@@ -670,7 +666,7 @@ class Recorder:
                 f.attrs["n_frames"] = len(self.cam_t)
                 f.attrs["mean_rate_hz"] = (len(self.cam_t) / duration
                                            if duration > 0 else 0.0)
-                f.attrs["rgb_size"] = list(RGB_SIZE)
+                f.attrs["rgb_size"] = list(SAVED_IMAGE_SIZE)
                 f.attrs["depth_size"] = list(DEPTH_SIZE)
                 f.attrs["jpeg_quality"] = JPEG_QUALITY
                 f.attrs["target_fps"] = CAMERA_FPS
@@ -681,12 +677,46 @@ class Recorder:
                   f"{exc.__class__.__name__}: {exc}")
             return False
 
+    def _write_global_camera(self, path, duration):
+        try:
+            with h5py.File(path, "x") as f:
+                f.create_dataset("timestamps", data=np.asarray(self.global_t),
+                                 compression=self.compression)
+                d = f.create_dataset("color_jpeg", (len(self.global_jpg),),
+                                     dtype=h5py.vlen_dtype(np.uint8))
+                for i, buf in enumerate(self.global_jpg):
+                    d[i] = np.frombuffer(buf, dtype=np.uint8)
+                self._common_attrs(f, duration)
+                f.attrs["stream"] = "global_camera"
+                f.attrs["rgb_size"] = list(SAVED_IMAGE_SIZE)
+                f.attrs["n_frames"] = len(self.global_t)
+                f.attrs["target_fps"] = CAMERA_FPS
+            return True
+        except Exception as exc:
+            print(f"[REC] GLOBAL CAMERA WRITE FAILED {path}: "
+                  f"{exc.__class__.__name__}: {exc}")
+            return False
+
+
+def saved_rgb(frame):
+    """Fit a BGR camera frame into 224 x 224 without cutting off the scene."""
+    width, height = SAVED_IMAGE_SIZE
+    src_h, src_w = frame.shape[:2]
+    scale = min(width / src_w, height / src_h)
+    resized = cv2.resize(frame, (round(src_w * scale), round(src_h * scale)),
+                         interpolation=cv2.INTER_AREA)
+    out = np.zeros((height, width, 3), dtype=np.uint8)
+    y = (height - resized.shape[0]) // 2
+    x = (width - resized.shape[1]) // 2
+    out[y:y + resized.shape[0], x:x + resized.shape[1]] = resized
+    return out
+
 
 class CameraSource:
     """OAK-D on its own thread. Pushes frames straight into the recorder.
 
-    Runs at CAMERA_FPS regardless of the control loop rate, so frames carry
-    their own device timestamps. JPEG encoding happens here, off the control
+    Runs at CAMERA_FPS regardless of the control loop rate. JPEG encoding
+    happens here, off the control
     thread. cv2.imencode releases the GIL, so this costs the loop very little.
     """
 
@@ -759,20 +789,22 @@ class CameraSource:
 
                     frame = q_rgb.tryGet()
                     if frame is not None:
+                        stamp = time.monotonic()
                         self.frames += 1
                         self.last_shape = (frame.getWidth(), frame.getHeight())
                         rgb = frame.getCvFrame()
-                        if self.preview_map is not None and rgb.shape == (400, 640, 3):
+                        if (self.preview_map is not None
+                                and rgb.shape == (RGB_SIZE[1], RGB_SIZE[0], 3)):
                             slot = 1 - self.preview_map[0]
-                            offset = 1 + slot * PREVIEW_FRAME_BYTES
+                            offset = 2 + slot * PREVIEW_FRAME_BYTES
                             np.ndarray(rgb.shape, dtype=np.uint8,
                                        buffer=self.preview_map, offset=offset)[:] = rgb
                             self.preview_map[0] = slot
                         if self.recorder.active:
-                            ok, buf = cv2.imencode(".jpg", rgb, enc)
+                            ok, buf = cv2.imencode(".jpg", saved_rgb(rgb), enc)
                             if ok:
                                 self.recorder.camera_sample(
-                                    frame.getTimestamp().total_seconds(),
+                                    stamp,
                                     buf.tobytes(),
                                     latest_depth if latest_depth is not None
                                     else np.zeros((DEPTH_SIZE[1], DEPTH_SIZE[0]),
@@ -782,6 +814,90 @@ class CameraSource:
         except Exception as exc:
             print(f"[warn] camera thread stopped: {exc.__class__.__name__}: {exc}")
             self.enabled = False
+
+
+class GlobalCameraSource:
+    """Read RealSense RGB on its own thread for recording and live preview."""
+
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.enabled = CAMERA and cv2 is not None
+        self.running = False
+        self.thread = None
+        self.process = None
+        self.frames = 0
+        self.preview_map = None
+
+    def start(self):
+        if not self.enabled:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        time.sleep(1.0)
+        print(f"[init] Global RGB streaming ({self.frames} frames seen so far)")
+
+    def stop(self):
+        self.running = False
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+        if self.thread is not None:
+            self.thread.join(timeout=3.0)
+
+    def _run(self):
+        try:
+            from nero_camera_preview import real_sense_rgb_index
+
+            index = real_sense_rgb_index()
+            width, height = GLOBAL_CAPTURE_SIZE
+            self.process = subprocess.Popen(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
+                 "-framerate", str(CAMERA_FPS), "-video_size", f"{width}x{height}",
+                 "-i", f"{index}:none", "-an", "-pix_fmt", "bgr24",
+                 "-f", "rawvideo", "pipe:1"], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+            frame_bytes = width * height * 3
+            enc = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            while self.running:
+                raw = self.process.stdout.read(frame_bytes)
+                if len(raw) != frame_bytes:
+                    break
+                stamp = time.monotonic()
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+                self.frames += 1
+                if self.preview_map is not None:
+                    panel = cv2.resize(frame, RGB_SIZE, interpolation=cv2.INTER_AREA)
+                    slot = 1 - self.preview_map[1]
+                    offset = 2 + (2 + slot) * PREVIEW_FRAME_BYTES
+                    np.ndarray(panel.shape, dtype=np.uint8,
+                               buffer=self.preview_map, offset=offset)[:] = panel
+                    self.preview_map[1] = slot
+                if self.recorder.active:
+                    ok, buf = cv2.imencode(".jpg", saved_rgb(frame), enc)
+                    if ok:
+                        self.recorder.global_sample(stamp, buf.tobytes())
+            if self.running:
+                print("[warn] Global RGB stopped returning frames")
+        except Exception as exc:
+            print(f"[warn] global camera stopped: {exc.__class__.__name__}: {exc}")
+        finally:
+            self.enabled = False
+            if self.process is not None:
+                if self.process.poll() is None:
+                    self.process.terminate()
+                try:
+                    self.process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+                if self.running and self.process.stderr is not None:
+                    error = self.process.stderr.read(1000).decode(errors="replace").strip()
+                    if error:
+                        print(f"[warn] ffmpeg: {error}")
+                if self.process.stdout is not None:
+                    self.process.stdout.close()
+                if self.process.stderr is not None:
+                    self.process.stderr.close()
 
 
 # ------------------------------------------------------------------- setup ---
@@ -900,6 +1016,10 @@ if HOME_ON_START:
 
 if DRY_HOME:
     if homed:
+        if MIRROR_GRIPPER:
+            leader_gripper.move_gripper_m(value=0.0, force=LEADER_GRIP_FORCE)
+            follower_gripper.move_gripper_m(value=0.0, force=FOLLOWER_GRIP_FORCE)
+            print("[dry-home] Closing both grippers.")
         print("\n[dry-home] Start pose reached. Shutting down without teleop.")
         print("[dry-home] If the settle numbers above look right, re-run "
               "without the flag.")
@@ -917,6 +1037,8 @@ last_toggle = 0.0
 recorder = Recorder(RECORD_DIR, RECORD_FOLLOWER, H5_COMPRESSION)
 camera = CameraSource(recorder)
 camera.start()
+global_camera = GlobalCameraSource(recorder)
+global_camera.start()
 
 if not DRY_HOME:
     _gc_name = "SPACE" if GC_TOGGLE_KEY == " " else GC_TOGGLE_KEY
@@ -934,7 +1056,7 @@ if not DRY_HOME:
     print()
     print(f"  Normal cycle:  {HOME_KEY} -> {REC_START_KEY} -> demonstrate -> "
           f"{REC_END_KEY} -> {HOME_KEY} -> {REC_START_KEY} -> ...")
-    print("  Every demo is written as its own ep_NNNN_<timestamp>_*.h5 pair.")
+    print("  Every demo is written as timestamped joint and two-camera HDF5 files.")
     print()
     print("  Gravity comp stays ON throughout — it is NOT tied to recording.")
     print(f"  {HOME_KEY} drops it for the move and puts it back on its own.")
@@ -958,6 +1080,9 @@ if not DRY_HOME:
     if PREVIEW_CAMERAS:
         print("  Live preview: RealSense global RGB + OAK wrist RGB")
         print("  Control keys work in the preview window or terminal.")
+    if RECORD:
+        print(f"  Saved RGB: {SAVED_IMAGE_SIZE[0]}x{SAVED_IMAGE_SIZE[1]} "
+              f"at up to {CAMERA_FPS} fps; dataset export: {DATASET_FPS} fps")
     print("=" * 68)
 print()
 
@@ -1028,6 +1153,15 @@ def start_demo():
         print(f"[rec] gravity comp is OFF — hold the leader and press "
               f"{'SPACE' if GC_TOGGLE_KEY == ' ' else GC_TOGGLE_KEY} first")
         return
+    if not TASK_TEXT.strip():
+        print("[rec] Set TASK_TEXT in nero_user_config.py before recording")
+        return
+    if not (recorder.enabled and MIRROR_GRIPPER and RECORD_FOLLOWER
+            and camera.enabled and camera.frames > 0
+            and global_camera.enabled and global_camera.frames > 0):
+        print("[rec] Both RGB feeds, follower feedback, and gripper mirroring "
+              "are required for a π0.5 demo")
+        return
     recorder.start()
 
 
@@ -1063,9 +1197,10 @@ try:
     if PREVIEW_CAMERAS:
         with tempfile.NamedTemporaryFile(prefix="nero_cameras_", delete=False) as frame_file:
             preview_path = frame_file.name
-            frame_file.truncate(1 + 2 * PREVIEW_FRAME_BYTES)
+            frame_file.truncate(2 + 4 * PREVIEW_FRAME_BYTES)
             preview_map = mmap.mmap(frame_file.fileno(), 0)
         camera.preview_map = preview_map
+        global_camera.preview_map = preview_map
         preview_process = subprocess.Popen(
             [sys.executable, PREVIEW_SCRIPT, preview_path],
             stdout=subprocess.PIPE,
@@ -1124,6 +1259,15 @@ try:
 
             leader_state = None
             leader_w = None
+            target_joints = None
+            target_width = None
+            fj, fw = None, None
+            if recorder.active:
+                fj = unwrap(_try("follower.get_joint_angles",
+                                 follower.get_joint_angles))
+                fwm = unwrap(_try("follower gripper",
+                                  follower_gripper.get_gripper_status))
+                fw = None if fwm is None else fwm.value
 
             # ---- joint tracking: pick the reader that is live in this mode ----
             try:
@@ -1134,6 +1278,7 @@ try:
                 if state is not None:
                     leader_state = list(state)
                     follower.move_js(leader_state)
+                    target_joints = leader_state
                 else:
                     logger.log("track", "[warn] no leader joint frame this tick")
             except Exception as exc:
@@ -1151,21 +1296,17 @@ try:
                 if leader_w is None:
                     logger.log("gripnone", "[warn] no gripper frame this tick")
                 elif MIRROR_GRIPPER:
+                    mapped = map_width(leader_w)
                     follower_gripper.move_gripper_m(
-                        value=map_width(leader_w), force=FOLLOWER_GRIP_FORCE)
+                        value=mapped, force=FOLLOWER_GRIP_FORCE)
+                    target_width = mapped
             except Exception as exc:
                 logger.log("grip", f"[warn] gripper: {exc.__class__.__name__}: {exc}")
 
             # ---- record ------------------------------------------------------
             if recorder.active:
-                fj, fw = None, None
-                if RECORD_FOLLOWER:
-                    fj = unwrap(_try("follower.get_joint_angles",
-                                     follower.get_joint_angles))
-                    fwm = unwrap(_try("follower gripper",
-                                      follower_gripper.get_gripper_status))
-                    fw = None if fwm is None else fwm.value
-                recorder.sample(leader_state, leader_w, fj, fw)
+                recorder.sample(leader_state, leader_w, fj, fw,
+                                target_joints, target_width)
 
             # ---- fixed-rate scheduling ---------------------------------------
             next_tick += LOOP_DT
@@ -1182,6 +1323,7 @@ finally:
     # Flush an episode that was still running when you quit, then stop the camera.
     _try("recorder.stop", recorder.stop, True)
     _try("camera.stop", camera.stop)
+    _try("global_camera.stop", global_camera.stop)
     if preview_process is not None:
         if preview_process.poll() is None:
             preview_process.terminate()

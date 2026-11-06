@@ -10,9 +10,11 @@ import time
 
 import cv2
 import numpy as np
+from nero_user_config import PREVIEW_FPS, WRIST_CAPTURE_SIZE
 
 
-WRIST_SHAPE = (400, 640, 3)
+WRIST_SHAPE = (WRIST_CAPTURE_SIZE[1], WRIST_CAPTURE_SIZE[0], 3)
+PREVIEW_WIDTH, PREVIEW_HEIGHT = WRIST_CAPTURE_SIZE
 FRAME_BYTES = int(np.prod(WRIST_SHAPE))
 WINDOW = "NERO cameras"
 
@@ -25,9 +27,9 @@ def real_sense_rgb_index():
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         raise SystemExit("Camera preview needs ffmpeg: brew install ffmpeg") from exc
-    match = re.search(r"\[(\d+)\] Intel\(R\) RealSense.* RGB\s*$", result.stderr, re.M)
+    match = re.search(r"\[(\d+)\] Intel\(R\) RealSense[^\n]* RGB\s*$", result.stderr, re.M)
     if match is None:
-        raise SystemExit("RealSense RGB is not listed by macOS. Reconnect its USB cable.")
+        raise SystemExit("RealSense RGB is not listed by macOS; only its Depth/IR feed may be available. Reconnect its USB cable.")
     return int(match.group(1))
 
 
@@ -35,11 +37,11 @@ def panel(frame, label):
     out = np.zeros(WRIST_SHAPE, dtype=np.uint8)
     if frame is not None:
         h, w = frame.shape[:2]
-        scale = min(640 / w, 400 / h)
+        scale = min(PREVIEW_WIDTH / w, PREVIEW_HEIGHT / h)
         image = cv2.resize(frame, (round(w * scale), round(h * scale)),
                            interpolation=cv2.INTER_AREA)
-        y = (400 - image.shape[0]) // 2
-        x = (640 - image.shape[1]) // 2
+        y = (PREVIEW_HEIGHT - image.shape[0]) // 2
+        x = (PREVIEW_WIDTH - image.shape[1]) // 2
         out[y:y + image.shape[0], x:x + image.shape[1]] = image
     cv2.putText(out, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX,
                 0.8, (0, 0, 0), 4, cv2.LINE_AA)
@@ -49,30 +51,21 @@ def panel(frame, label):
 
 
 def show(path):
-    index = real_sense_rgb_index()
-    # OpenCV's AVFoundation capture can return black frames from this D435
-    # even while ffmpeg reads the RGB stream correctly.
-    camera = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
-         "-framerate", "30", "-video_size", "640x480", "-i", f"{index}:none",
-         "-an", "-vf", "fps=15", "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"],
-        stdout=subprocess.PIPE,
-    )
     try:
         with open(path, "r+b") as frame_file:
             with mmap.mmap(frame_file.fileno(), 0, access=mmap.ACCESS_READ) as shared:
                 cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(WINDOW, 1280, 400)
+                cv2.resizeWindow(WINDOW, 2 * PREVIEW_WIDTH, PREVIEW_HEIGHT)
                 while True:
                     started = time.perf_counter()
-                    raw = camera.stdout.read(640 * 480 * 3)
-                    if len(raw) != 640 * 480 * 3:
-                        raise SystemExit("RealSense RGB stopped returning frames")
-                    global_frame = np.frombuffer(raw, dtype=np.uint8).reshape(480, 640, 3)
                     slot = shared[0]
-                    offset = 1 + slot * FRAME_BYTES
+                    offset = 2 + slot * FRAME_BYTES
                     wrist = np.ndarray(WRIST_SHAPE, dtype=np.uint8,
                                        buffer=shared, offset=offset).copy()
+                    global_slot = shared[1]
+                    global_offset = 2 + (2 + global_slot) * FRAME_BYTES
+                    global_frame = np.ndarray(WRIST_SHAPE, dtype=np.uint8,
+                                              buffer=shared, offset=global_offset).copy()
                     view = np.hstack((panel(global_frame, "GLOBAL RGB"),
                                       panel(wrist, "WRIST RGB")))
                     cv2.imshow(WINDOW, view)
@@ -81,11 +74,8 @@ def show(path):
                         os.write(sys.stdout.fileno(), bytes([key]))
                     if key == ord("q") or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                         break
-                    time.sleep(max(0, 1 / 15 - (time.perf_counter() - started)))
+                    time.sleep(max(0, 1 / PREVIEW_FPS - (time.perf_counter() - started)))
     finally:
-        camera.terminate()
-        camera.wait()
-        camera.stdout.close()
         cv2.destroyAllWindows()
 
 
